@@ -301,6 +301,12 @@ class TransformerDecoder(BaseTransformerDecoder):
             ),
         )
 
+    def revert_steps(self, state: Any, steps_to_keep) -> Any:
+        return [
+            layer[:steps_to_keep - 1,:]
+            for layer in state
+        ]
+
 
 class LightweightConvolutionTransformerDecoder(BaseTransformerDecoder):
     def __init__(

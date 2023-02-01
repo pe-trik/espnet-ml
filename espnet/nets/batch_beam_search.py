@@ -66,6 +66,27 @@ class BatchBeamSearch(BeamSearch):
             hs=hs,
         )
 
+    def _batch_select_stable_prefix(self, best: BatchHypothesis, stable_len: int) -> BatchHypothesis:
+        """Selects the first beam as stable and cuts the decoded sequence to 'stable_len'"""
+        assert len(best) == 1 and best.length[0] >= stable_len
+
+        if self.return_hs:
+            hs = [best.hs[i] for i in [0,]]
+        else:
+            hs = []
+            
+        return BatchHypothesis(
+            yseq=best.yseq[:1, :stable_len],
+            score=best.score[:1],
+            length=best.length[:1] - best.length[:1] + stable_len,
+            scores={k: v[:1] for k, v in best.scores.items()},
+            states={
+                k: [self.scorers[k].revert_steps(self.scorers[k].select_state(v, i), stable_len) for i in [0,]]
+                for k, v in best.states.items()
+            },
+            hs=hs,
+        )
+
     def _select(self, hyps: BatchHypothesis, i: int) -> Hypothesis:
         return Hypothesis(
             yseq=hyps.yseq[i, : hyps.length[i]],

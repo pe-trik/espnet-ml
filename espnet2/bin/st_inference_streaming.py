@@ -73,6 +73,8 @@ class Speech2TextStreaming:
         encoded_feat_length_limit=0,
         time_sync: bool = False,
         incremental_decode: bool = False,
+        incremental_strategy: str = None,
+        ctc_wait: int = None,
     ):
         assert check_argument_types()
 
@@ -157,6 +159,8 @@ class Speech2TextStreaming:
                 decoder_text_length_limit=decoder_text_length_limit,
                 encoded_feat_length_limit=encoded_feat_length_limit,
                 incremental_decode=incremental_decode,
+                incremental_strategy=incremental_strategy,
+                ctc_wait=ctc_wait,
             )
 
             non_batch = [

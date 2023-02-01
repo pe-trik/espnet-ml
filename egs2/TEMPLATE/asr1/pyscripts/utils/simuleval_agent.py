@@ -104,6 +104,7 @@ class DummyAgent(SpeechToTextAgent):
                 decoder_text_length_limit=kwargs['decoder_text_length_limit'],
                 encoded_feat_length_limit=kwargs['encoded_feat_length_limit'],
                 incremental_decode=kwargs['incremental_decode'],
+                incremental_strategy=kwargs['incremental_strategy'],
             )
             self.speech2text = Speech2TextStreaming(**speech2text_kwargs)
         
@@ -347,6 +348,20 @@ class DummyAgent(SpeechToTextAgent):
             default=False,
         )
 
+        group.add_argument(
+            '--incremental-strategy',
+            type=str,
+            default='hold-2',
+            help='Policy for selection of stable prefix for incremental decoding: hold-N (deletes last N tokens from output), local-agreement-N (Evaluates every N blocks. Takes last two generated hypotheses and outputs their common prefix).'
+        )
+
+        group.add_argument(
+            '--ctc-wait',
+            type=int,
+            default=None,
+            help='Dynamic maxlen for decoding unfinished source. Maxlen = len(greedy CTC) - ctc-wait.'
+        )
+
         return parser
 
     def clean(self):
@@ -375,11 +390,15 @@ class DummyAgent(SpeechToTextAgent):
                 results = self.speech2text(speech=speech, is_final=self.states.source_finished)
                 self.processed_index = len(self.states.source) - 1
                 if not self.states.source_finished:
-                    if self.speech2text.beam_search.running_hyps and len(self.speech2text.beam_search.running_hyps.yseq[0]) > self.maxlen:
-                        prediction = self.speech2text.beam_search.running_hyps.yseq[0][1:]
-                        prediction = self.speech2text.converter.ids2tokens(prediction)
-                        prediction = self.speech2text.tokenizer.tokens2text(prediction)
-                        self.maxlen = len(self.speech2text.beam_search.running_hyps.yseq[0])
+                    prediction = results[0][2] if results else []
+                    prediction = self.speech2text.converter.ids2tokens(prediction)
+                    idx = 0
+                    for idx, token in reversed(list(enumerate(prediction))):
+                        if token.startswith('▁'):
+                            break
+                    if idx > self.maxlen:
+                        prediction = self.speech2text.tokenizer.tokens2text(prediction[:idx])
+                        self.maxlen = idx
                     else:
                         return ReadAction()
                 else:

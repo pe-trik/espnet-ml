@@ -49,6 +49,19 @@ class ScorerInterface:
         """
         return None if state is None else state[i]
 
+    def revert_steps(self, state: Any, steps_to_keep: int) -> Any:
+        """Cuts the state's prefix to steps_to_keep
+
+        Args:
+            state: Decoder state for prefix tokens
+            steps_to_keep (int): Length of the prefix
+
+        Returns:
+            state: pruned state
+
+        """
+        raise NotImplementedError
+
     def score(
         self, y: torch.Tensor, state: Any, x: torch.Tensor
     ) -> Tuple[torch.Tensor, Any]:

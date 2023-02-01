@@ -36,6 +36,8 @@ class BatchBeamSearchOnline(BatchBeamSearch):
         encoded_feat_length_limit=0,
         decoder_text_length_limit=0,
         incremental_decode=False,
+        incremental_strategy=None,
+        ctc_wait=None,
         **kwargs,
     ):
         """Initialize beam search."""
@@ -47,6 +49,20 @@ class BatchBeamSearchOnline(BatchBeamSearch):
         self.encoded_feat_length_limit = encoded_feat_length_limit
         self.decoder_text_length_limit = decoder_text_length_limit
         self.incremental_decode = incremental_decode
+        
+        self.hold_n = -1
+        self.local_agreement = -1
+        self.ctc_wait = ctc_wait if ctc_wait else -1
+        self.ctc_greedy_len = 0
+
+        if incremental_strategy:
+            if incremental_strategy.startswith('hold-'):
+                self.hold_n = int(incremental_strategy[5:])
+            elif incremental_strategy.startswith('local-agreement-'):
+                self.local_agreement = int(incremental_strategy[16:])
+            else:
+                logging.error('Unsupported incremental strategy. Supported: hold-N and local-agreement-K.')
+
 
         self.reset()
 
@@ -54,11 +70,12 @@ class BatchBeamSearchOnline(BatchBeamSearch):
         """Reset parameters."""
         self.encbuffer = None
         self.running_hyps = None
-        self.prev_hyps = []
+        self.prev_hyps = None
         self.ended_hyps = []
         self.processed_block = 0
         self.process_idx = 0
         self.prev_output = None
+        self.seen_unreliable_hyps = dict()
 
     def score_full(
         self, hyp: BatchHypothesis, x: torch.Tensor, pre_x: torch.Tensor = None
@@ -166,13 +183,6 @@ class BatchBeamSearchOnline(BatchBeamSearch):
             ret = self.process_one_block(h, block_is_final, maxlen, maxlenratio)
             logging.debug("Finished processing block: %d", self.processed_block)
             self.processed_block += 1
-            
-            # prune running_hyps, taking top as an incremental decoding
-            if self.incremental_decode:
-                logging.debug("Hyps befor  e incremental pruning: %d", self.running_hyps.yseq.shape[0])
-                if self.running_hyps.yseq.shape[0] > 0:
-                    self.running_hyps = self._batch_select(self.running_hyps, [0])
-                logging.debug("Hyps after incremental pruning: %d", self.running_hyps.yseq.shape[0])
 
             if block_is_final:
                 return ret
@@ -186,92 +196,116 @@ class BatchBeamSearchOnline(BatchBeamSearch):
             # N-best results
             return ret
 
+    def add_seen_unreliable_hypo(self, seq):
+        seq = seq.cpu().numpy()
+        unreliable = self.seen_unreliable_hyps
+        for t in seq:
+            if t not in unreliable:
+                unreliable[t] = {}
+            unreliable = unreliable[t]
+
+    def is_in_seen_unreliable_hypo(self, seq):
+        seq = seq.cpu().numpy()
+        unreliable = self.seen_unreliable_hyps
+        for t in seq:
+            if t in unreliable:
+                unreliable = unreliable[t]
+            else:
+                return False
+        return True
+
     def process_one_block(self, h, is_final, maxlen, maxlenratio):
         """Recognize one block."""
         # extend states for ctc
         self.extend(h, self.running_hyps)
+
+        if not is_final:
+            if self.ctc_wait > -1:
+                maxlen = self.ctc_greedy_len - self.ctc_wait + 1
+        
+            if self.local_agreement > 0 and self.processed_block % self.local_agreement > 0:
+                return None
+
+        finished_hyps = []
+        max_unreliable_score_score = -float('inf') #anything <= is also considered unreliable
         while self.process_idx < maxlen:
             logging.debug("position " + str(self.process_idx))
             best = self.search(self.running_hyps, h)
 
+            # We reduce the beam search by the number of finished hypotheses
+            if len(best) > self.beam_size - len(finished_hyps):
+                best = self._batch_select(best, list(range(self.beam_size - len(finished_hyps))))
+                assert len(best) > 0
+
             if self.process_idx == maxlen - 1:
-                # end decoding
+                best.yseq[:, best.length - 1] = self.eos
+
+            n_batch = best.yseq.shape[0]
+            local_ended_hyps = set()
+            is_local_eos = best.yseq[torch.arange(n_batch), best.length - 1] == self.eos
+            for i in range(n_batch):
+                # Always remove beams with EOS 
+                if is_local_eos[i] or (
+                    not self.disable_repetition_detection
+                    and (
+                        best.yseq[i, -1] in best.yseq[i, :-1]   # repetition
+                        or best.score[i] <= max_unreliable_score_score
+                    )
+                    # We allow repetitions if generated again with more context
+                    and not self.is_in_seen_unreliable_hypo(best.yseq[i]) 
+                    and not is_final
+                ):
+                    hyp = self._batch_select(best, [i,])
+                    local_ended_hyps.add(i)
+                    finished_hyps.append(hyp)
+                    max_unreliable_score_score = max(max_unreliable_score_score, hyp.score[0])
+                    self.add_seen_unreliable_hypo(hyp.yseq[0])
+
+            # remove finished/unreliable beams 
+            if len(local_ended_hyps) > 0:
+                beams_to_keep = set(range(n_batch)).difference(local_ended_hyps)
+                best = self._batch_select(best, list(beams_to_keep))
+
+            if len(best) == 0:
+                logging.info("All beams finished.")
+                break
+            else:
                 self.running_hyps = self.post_process(
                     self.process_idx, maxlen, maxlenratio, best, self.ended_hyps
                 )
-            n_batch = best.yseq.shape[0]
-            local_ended_hyps = []
-            is_local_eos = best.yseq[torch.arange(n_batch), best.length - 1] == self.eos
-            prev_repeat = False
-            for i in range(is_local_eos.shape[0]):
-                if is_local_eos[i]:
-                    hyp = self._select(best, i)
-                    local_ended_hyps.append(hyp)
-                # NOTE(tsunoo): check repetitions here
-                # This is a implicit implementation of
-                # Eq (11) in https://arxiv.org/abs/2006.14941
-                # A flag prev_repeat is used instead of using set
-                # NOTE(fujihara): I made it possible to turned off
-                # the below lines using disable_repetition_detection flag,
-                # because this criteria is too sensitive that the beam
-                # search starts only after the entire inputs are available.
-                # Empirically, this flag didn't affect the performance.
-                elif (
-                    not self.disable_repetition_detection
-                    and not prev_repeat
-                    and best.yseq[i, -1] in best.yseq[i, :-1]
-                    and not is_final
-                ):
-                    prev_repeat = True
-            if prev_repeat:
-                logging.info("Detected repetition.")
-                break
 
-            if (
-                is_final
-                and maxlenratio == 0.0
-                and end_detect(
-                    [lh.asdict() for lh in self.ended_hyps], self.process_idx
-                )
-            ):
-                logging.info(f"end detected at {self.process_idx}")
-                return self.assemble_hyps(self.ended_hyps)
-
-            if len(local_ended_hyps) > 0 and not is_final:
-                logging.info("Detected hyp(s) reaching EOS in this block.")
-                break
-
-            self.prev_hyps = self.running_hyps
-            self.running_hyps = self.post_process(
-                self.process_idx, maxlen, maxlenratio, best, self.ended_hyps
-            )
-
-            if is_final:
-                for hyp in local_ended_hyps:
-                    self.ended_hyps.append(hyp)
-
-            if len(self.running_hyps) == 0:
-                logging.info("no hypothesis. Finish decoding.")
-                return self.assemble_hyps(self.ended_hyps)
-            else:
-                logging.debug(f"remained hypotheses: {len(self.running_hyps)}")
             # increment number
             self.process_idx += 1
 
         if is_final:
-            return self.assemble_hyps(self.ended_hyps)
-        else:
-            for hyp in self.ended_hyps:
-                local_ended_hyps.append(hyp)
-            rets = self.assemble_hyps(local_ended_hyps)
+            finished_hyps = [self._select(h, 0) for h in finished_hyps]
+            return self.assemble_hyps(finished_hyps)
+        elif len(finished_hyps) > 0:
+            # Sort by length-normalized score
+            rets = sorted(finished_hyps, key=lambda x: x.score / x.length[0], reverse=True)
+            best : BatchHypothesis = rets[0]
+            # Always keep SOS token 
+            stable_length = max(1, best.length[0] - 1)
+            if self.hold_n > -1:
+                stable_length = max(1, stable_length - self.hold_n)
+            elif self.local_agreement > 0:
+                stable_length = self._compute_local_agreement(best)
+                self.prev_hyps = best.yseq[0].cpu().numpy()
+            best = self._batch_select_stable_prefix(best, stable_length)
+            self.running_hyps = best
+            self.process_idx = stable_length - 1
+            return [self._select(best, 0),]
+        return None
 
-            if self.process_idx > 1 and len(self.prev_hyps) > 0:
-                self.running_hyps = self.prev_hyps
-                self.process_idx -= 1
-                self.prev_hyps = []
-
-            # N-best results
-            return rets
+    def _compute_local_agreement(self, best: BatchHypothesis):
+        if self.prev_hyps is None:
+            return 1
+        prev = self.prev_hyps
+        best = best.yseq[0].numpy()
+        for idx, (pt, bt) in enumerate(zip(prev, best)):
+            if pt != bt:
+                break
+        return idx
 
     def assemble_hyps(self, ended_hyps):
         """Assemble the hypotheses."""
@@ -317,3 +351,5 @@ class BatchBeamSearchOnline(BatchBeamSearch):
                 d.extend_prob(x)
             if hasattr(d, "extend_state"):
                 hyps.states[k] = d.extend_state(hyps.states[k])
+            if hasattr(d, "get_ctc_greedy_len"):
+                self.ctc_greedy_len = d.get_ctc_greedy_len()

@@ -22,6 +22,7 @@ class CTCPrefixScorer(BatchPartialScorerInterface):
         self.ctc = ctc
         self.eos = eos
         self.impl = None
+        self.decoded = []
 
     def init_state(self, x: torch.Tensor):
         """Get an initial state for decoding.
@@ -35,6 +36,8 @@ class CTCPrefixScorer(BatchPartialScorerInterface):
         logp = self.ctc.log_softmax(x.unsqueeze(0)).detach().squeeze(0).cpu().numpy()
         # TODO(karita): use CTCPrefixScoreTH
         self.impl = CTCPrefixScore(logp, 0, self.eos, np)
+        self.decoded = []
+        self._ctc_greedy_decode(logp)
         return 0, self.impl.initial_state()
 
     def select_state(self, state, i, new_id=None):
@@ -120,7 +123,7 @@ class CTCPrefixScorer(BatchPartialScorerInterface):
                 state[0][2],
                 state[0][3],
             )
-            if state[0] is not None
+            if state is not None and state[0] is not None
             else None
         )
         return self.impl(y, batch_state, ids)
@@ -136,6 +139,7 @@ class CTCPrefixScorer(BatchPartialScorerInterface):
 
         """
         logp = self.ctc.log_softmax(x.unsqueeze(0))
+        self._ctc_greedy_decode(logp)
         self.impl.extend_prob(logp)
 
     def extend_state(self, state):
@@ -155,3 +159,19 @@ class CTCPrefixScorer(BatchPartialScorerInterface):
             new_state.append(self.impl.extend_state(s))
 
         return new_state
+
+    def revert_steps(self, states, steps_to_keep: int = None):
+        import logging
+        logging.warning(f'Reverting steps not implemented in {__file__}:165')
+        return states
+
+    def _ctc_greedy_decode(self, logp: torch.FloatTensor):
+        last_decoded_token, decoded = 0, []
+        for t in logp[0].argmax(-1).cpu().numpy():
+            if t != last_decoded_token and t != 0:
+                decoded.append(t)
+            last_decoded_token = t
+        self.decoded = decoded
+
+    def get_ctc_greedy_len(self):
+        return len(self.decoded)
