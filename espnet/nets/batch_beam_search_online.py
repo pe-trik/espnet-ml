@@ -148,19 +148,10 @@ class BatchBeamSearchOnline(BatchBeamSearch):
             maxlen = max(1, int(maxlenratio * x.size(0)))
 
         ret = None
-        while True:
-            cur_end_frame = (
-                self.block_size - self.look_ahead + self.hop_size * self.processed_block
-            )
-            if cur_end_frame < x.shape[0]:
-                h = x.narrow(0, 0, cur_end_frame)
-                block_is_final = False
-            else:
-                if is_final:
-                    h = x
-                    block_is_final = True
-                else:
-                    break
+        if x.shape[0] > 0:
+            block_is_final = is_final
+            h = x
+            logging.info(f'processing {h.shape[0]} out of {x.shape[0]}')
 
             logging.debug("Start processing block: %d", self.processed_block)
             logging.debug(
@@ -183,7 +174,6 @@ class BatchBeamSearchOnline(BatchBeamSearch):
             ret = self.process_one_block(h, block_is_final, maxlen, maxlenratio)
             logging.debug("Finished processing block: %d", self.processed_block)
             self.processed_block += 1
-
             if block_is_final:
                 return ret
         if ret is None:
@@ -248,7 +238,7 @@ class BatchBeamSearchOnline(BatchBeamSearch):
                 if is_local_eos[i] or (
                     not self.disable_repetition_detection
                     and (
-                        best.yseq[i, -1] in best.yseq[i, :-1]   # repetition
+                        (len(self.token_list[best.yseq[i, -1].item()].replace('▁', '')) > 0 and best.yseq[i, -1] in best.yseq[i, :-1])   # repetition
                         or best.score[i] <= max_unreliable_score_score
                     )
                     # We allow repetitions if generated again with more context
@@ -301,7 +291,7 @@ class BatchBeamSearchOnline(BatchBeamSearch):
         if self.prev_hyps is None:
             return 1
         prev = self.prev_hyps
-        best = best.yseq[0].numpy()
+        best = best.yseq[0].cpu().numpy()
         for idx, (pt, bt) in enumerate(zip(prev, best)):
             if pt != bt:
                 break
