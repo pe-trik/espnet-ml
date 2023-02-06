@@ -369,8 +369,12 @@ class Speech2TextStreaming:
         for hyp in nbest_hyps:
             assert isinstance(hyp, Hypothesis), type(hyp)
 
+            token_int = hyp.yseq.tolist()
             # remove sos/eos and get results
-            token_int = hyp.yseq[1:-1].tolist()
+            if len(token_int) > 0 and token_int[-1] == self.st_model.eos:
+                token_int = token_int[:-1]
+            if len(token_int) > 0 and token_int[0] == self.st_model.bos:
+                token_int = token_int[1:]
 
             # remove blank symbol id, which is assumed to be 0
             token_int = list(filter(lambda x: x != 0, token_int))
