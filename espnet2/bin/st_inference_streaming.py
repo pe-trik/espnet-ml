@@ -373,7 +373,7 @@ class Speech2TextStreaming:
             # remove sos/eos and get results
             if len(token_int) > 0 and token_int[-1] == self.st_model.eos:
                 token_int = token_int[:-1]
-            if len(token_int) > 0 and token_int[0] == self.st_model.bos:
+            if len(token_int) > 0 and token_int[0] == self.st_model.sos:
                 token_int = token_int[1:]
 
             # remove blank symbol id, which is assumed to be 0
