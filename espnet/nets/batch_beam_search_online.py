@@ -6,6 +6,7 @@ from typing import Dict  # noqa: H301
 from typing import List  # noqa: H301
 from typing import Tuple  # noqa: H301
 
+import copy
 import torch
 
 from espnet.nets.batch_beam_search import BatchBeamSearch  # noqa: H301
@@ -38,6 +39,7 @@ class BatchBeamSearchOnline(BatchBeamSearch):
         incremental_decode=False,
         incremental_strategy=None,
         ctc_wait=None,
+        recompute_decoder_states=False,
         **kwargs,
     ):
         """Initialize beam search."""
@@ -55,6 +57,8 @@ class BatchBeamSearchOnline(BatchBeamSearch):
         self.ctc_wait = ctc_wait if ctc_wait else -1
         self.ctc_greedy_len = 0
 
+        self.recompute_decoder_states = recompute_decoder_states
+
         if incremental_strategy:
             if incremental_strategy.startswith('hold-'):
                 self.hold_n = int(incremental_strategy[5:])
@@ -71,6 +75,7 @@ class BatchBeamSearchOnline(BatchBeamSearch):
         self.encbuffer = None
         self.running_hyps = None
         self.prev_hyps = None
+        self.stable = torch.tensor([])
         self.ended_hyps = []
         self.processed_block = 0
         self.process_idx = 0
@@ -209,9 +214,22 @@ class BatchBeamSearchOnline(BatchBeamSearch):
     def process_one_block(self, h, is_final, maxlen, maxlenratio):
         """Recognize one block."""
         # extend states for ctc
+        if self.recompute_decoder_states:
+            self.running_hyps = self.init_hyp(h)
+
         self.extend(h, self.running_hyps)
 
+        if self.recompute_decoder_states:
+            for token in self.stable[1:]:
+                self.running_hyps = self.search(
+                    self.running_hyps, 
+                    h, 
+                    force=token.unsqueeze(-1)
+                )
+        
         if not is_final:
+            prev_hypo = copy.deepcopy(self.running_hyps)
+            
             if self.ctc_wait > -1:
                 maxlen = self.ctc_greedy_len - self.ctc_wait + 1
         
@@ -282,18 +300,51 @@ class BatchBeamSearchOnline(BatchBeamSearch):
                 stable_length = max(1, stable_length - self.hold_n)
             elif self.local_agreement > 0:
                 stable_length = self._compute_local_agreement(best)
-                self.prev_hyps = best.yseq[0].cpu().numpy()
+            stable_length = max(
+                stable_length,
+                prev_hypo.length[0]
+            )
+            self.prev_hyps = best.yseq[0]
             best = self._batch_select_stable_prefix(best, stable_length)
-            self.running_hyps = best
+            self.stable = best.yseq[0]
             self.process_idx = stable_length - 1
+            
+            if not self.recompute_decoder_states:
+                self.running_hyps = self._update_ctc_state(prev_hypo, best)
+
             return [self._select(best, 0),]
         return None
+
+    def _update_ctc_state(self, prev_hypo : BatchHypothesis, current_hypo : BatchHypothesis) -> BatchHypothesis:
+        prev_hypo_len = prev_hypo.length[0]
+        current_hypo_len = current_hypo.length[0]
+        for scorer_name, part_scorer in self.part_scorers.items():
+            if 'ctc' in scorer_name:
+                new_state = prev_hypo.states[scorer_name]
+                for token_idx in torch.arange(prev_hypo_len, current_hypo_len):
+                    curr_y = current_hypo.yseq[0,:token_idx].view((1,-1))
+                    new_token = current_hypo.yseq[0,token_idx].view((1,1,-1))
+                    _, new_state = part_scorer.batch_score_partial(
+                        curr_y,
+                        new_token,
+                        new_state,
+                        None, # x
+                    )
+                    new_state = part_scorer.select_state(
+                        new_state,
+                        0,
+                        new_id=current_hypo.yseq[0,token_idx].item()
+                    )
+                    new_state = [new_state,]
+                current_hypo.states[scorer_name] = new_state
+        return current_hypo
+
 
     def _compute_local_agreement(self, best: BatchHypothesis):
         if self.prev_hyps is None:
             return 1
         prev = self.prev_hyps
-        best = best.yseq[0].cpu().numpy()
+        best = best.yseq[0,:-1]
         for idx, (pt, bt) in enumerate(zip(prev, best)):
             if pt != bt:
                 break
@@ -301,7 +352,7 @@ class BatchBeamSearchOnline(BatchBeamSearch):
 
     def assemble_hyps(self, ended_hyps):
         """Assemble the hypotheses."""
-        nbest_hyps = sorted(ended_hyps, key=lambda x: x.score, reverse=True)
+        nbest_hyps = sorted(ended_hyps, key=lambda x: x.score / len(x.yseq), reverse=True)
         # check the number of hypotheses reaching to eos
         if len(nbest_hyps) == 0:
             logging.warning(
@@ -314,7 +365,7 @@ class BatchBeamSearchOnline(BatchBeamSearch):
         best = nbest_hyps[0]
         for k, v in best.scores.items():
             logging.info(
-                f"{v:6.2f} * {self.weights[k]:3} = {v * self.weights[k]:6.2f} for {k}"
+                f"{v[-1].item():6.2f} * {self.weights[k]:3} = {v[-1].item() * self.weights[k]:6.2f} for {k}"
             )
         logging.info(f"total log probability: {best.score:.2f}")
         logging.info(f"normalized log probability: {best.score / len(best.yseq):.2f}")

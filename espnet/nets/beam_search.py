@@ -231,8 +231,8 @@ class BeamSearch(torch.nn.Module):
         local_ids = weighted_scores[ids].topk(self.beam_size)[1]
         return top_ids, local_ids
 
-    @staticmethod
     def merge_scores(
+        self,
         prev_scores: Dict[str, float],
         next_full_scores: Dict[str, torch.Tensor],
         full_idx: int,
@@ -258,9 +258,9 @@ class BeamSearch(torch.nn.Module):
         """
         new_scores = dict()
         for k, v in next_full_scores.items():
-            new_scores[k] = prev_scores[k] + v[full_idx]
+            new_scores[k] = self.append_token(prev_scores[k],  prev_scores[k][-1] + v[full_idx])
         for k, v in next_part_scores.items():
-            new_scores[k] = prev_scores[k] + v[part_idx]
+            new_scores[k] = self.append_token(prev_scores[k],  prev_scores[k][-1] + v[part_idx])
         return new_scores
 
     def merge_states(self, states: Any, part_states: Any, part_idx: int) -> Any:

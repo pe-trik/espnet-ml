@@ -43,7 +43,9 @@ class BatchBeamSearch(BeamSearch):
             ),
             length=torch.tensor([len(h.yseq) for h in hyps], dtype=torch.int64),
             score=torch.tensor([h.score for h in hyps]),
-            scores={k: torch.tensor([h.scores[k] for h in hyps]) for k in self.scorers},
+            scores={k: pad_sequence(
+                [h.scores[k] for h in hyps], batch_first=True, padding_value=-float('inf')
+            ) for k in self.scorers},
             states={k: [h.states[k] for h in hyps] for k in self.scorers},
             hs=hs,
         )
@@ -68,18 +70,20 @@ class BatchBeamSearch(BeamSearch):
 
     def _batch_select_stable_prefix(self, best: BatchHypothesis, stable_len: int) -> BatchHypothesis:
         """Selects the first beam as stable and cuts the decoded sequence to 'stable_len'"""
-        assert len(best) == 1 and best.length[0] >= stable_len
+        assert len(best) == 1 and best.length[0] >= stable_len, f"{best.length[0]}, {stable_len}"
 
         if self.return_hs:
             hs = [best.hs[i] for i in [0,]]
         else:
             hs = []
-            
+        score = best.score[:1] * 0
+        for k, v in best.scores.items():
+            score += self.weights[k] * v[0,stable_len - 1]
         return BatchHypothesis(
             yseq=best.yseq[:1, :stable_len],
-            score=best.score[:1],
+            score=score,
             length=best.length[:1] - best.length[:1] + stable_len,
-            scores={k: v[:1] for k, v in best.scores.items()},
+            scores={k: v[:1, :stable_len] for k, v in best.scores.items()},
             states={
                 k: [self.scorers[k].revert_steps(self.scorers[k].select_state(v, i), stable_len) for i in [0,]]
                 for k, v in best.states.items()
@@ -132,7 +136,10 @@ class BatchBeamSearch(BeamSearch):
                 Their shapes are all `(self.beam_size,)`
 
         """
-        top_ids = weighted_scores.view(-1).topk(self.beam_size)[1]
+        if ids is not None:
+            top_ids = ids
+        else:
+            top_ids = weighted_scores.view(-1).topk(self.beam_size)[1]
         # Because of the flatten above, `top_ids` is organized as:
         # [hyp1 * V + token1, hyp2 * V + token2, ..., hypK * V + tokenK],
         # where V is `self.n_vocab` and K is `self.beam_size`
@@ -154,7 +161,7 @@ class BatchBeamSearch(BeamSearch):
         init_scores = dict()
         for k, d in self.scorers.items():
             init_states[k] = d.batch_init_state(x)
-            init_scores[k] = 0.0
+            init_scores[k] = torch.tensor([0.0], device=x.device)
         return self.batchfy(
             [
                 Hypothesis(
@@ -250,7 +257,7 @@ class BatchBeamSearch(BeamSearch):
             new_states[k] = v
         return new_states
 
-    def search(self, running_hyps: BatchHypothesis, x: torch.Tensor, pre_x: torch.Tensor=None) -> BatchHypothesis:
+    def search(self, running_hyps: BatchHypothesis, x: torch.Tensor, pre_x: torch.Tensor=None,force=None) -> BatchHypothesis:
         """Search new tokens for running hypotheses and encoded speech x.
 
         Args:
@@ -263,7 +270,7 @@ class BatchBeamSearch(BeamSearch):
 
         """
         n_batch = len(running_hyps)
-        part_ids = None  # no pre-beam
+        part_ids = None if force is None else force.unsqueeze(-1)  # no pre-beam
         # batch scoring
         weighted_scores = torch.zeros(
             n_batch, self.n_vocab, dtype=x.dtype, device=x.device
@@ -276,7 +283,7 @@ class BatchBeamSearch(BeamSearch):
         for k in self.full_scorers:
             weighted_scores += self.weights[k] * scores[k]
         # partial scoring
-        if self.do_pre_beam:
+        if self.do_pre_beam and part_ids is None:
             pre_beam_scores = (
                 weighted_scores
                 if self.pre_beam_score_key == "full"
@@ -304,7 +311,7 @@ class BatchBeamSearch(BeamSearch):
             full_new_token_id,
             part_prev_hyp_id,
             part_new_token_id,
-        ) in zip(*self.batch_beam(weighted_scores, part_ids)):
+        ) in zip(*self.batch_beam(weighted_scores, force)):
             prev_hyp = prev_hyps[full_prev_hyp_id]
             if self.return_hs:
                 new_hs= prev_hyp.hs + [hs[full_prev_hyp_id].squeeze(0)]
