@@ -17,6 +17,7 @@ from espnet2.torch_utils.set_all_random_seed import set_all_random_seed
 import torch
 import logging
 
+from mosestokenizer import MosesDetokenizer
 
 @entrypoint
 class DummyAgent(SpeechToTextAgent):
@@ -110,6 +111,7 @@ class DummyAgent(SpeechToTextAgent):
         
         self.sim_chunk_length = kwargs['sim_chunk_length']
         self.backend = kwargs['backend']
+        self.detokenizer = MosesDetokenizer(args.detokenizer) if args.detokenizer else None
         self.clean()
 
     @staticmethod
@@ -362,6 +364,12 @@ class DummyAgent(SpeechToTextAgent):
             help='Dynamic maxlen for decoding unfinished source. Maxlen = len(greedy CTC) - ctc-wait.'
         )
 
+        group.add_argument(
+            "--detokenizer",
+            type=str,
+            default=None,
+        )
+
         return parser
 
     def clean(self):
@@ -392,20 +400,18 @@ class DummyAgent(SpeechToTextAgent):
                 if not self.states.source_finished:
                     prediction = results[0][2] if results else []
                     prediction = self.speech2text.converter.ids2tokens(prediction)
-                    idx = 0
-                    for idx, token in reversed(list(enumerate(prediction))):
-                        if token.startswith('▁'):
-                            break
-                    if idx > self.maxlen:
-                        prediction = self.speech2text.tokenizer.tokens2text(prediction[:idx])
-                        self.maxlen = idx
-                    else:
-                        return ReadAction()
+                    prediction = self.speech2text.tokenizer.tokens2text(prediction).replace('&quot;', '"')
+                    prediction = self.detokenizer(prediction.split())
+                    prediction = ' '.join(prediction.split()[:-1])
                 else:
-                    prediction = results[0][0]
+                    prediction = results[0][0].replace('&quot;', '"')
+                    prediction = self.detokenizer(prediction.split())
+                logging.info(prediction)
 
                 unwritten_length = len(prediction) - len("".join(self.states.target))
-                # if unwritten_length > 0:
+                if unwritten_length == 0 and not self.states.source_finished:
+                    return ReadAction()
+
                 print(self.processed_index, prediction[-unwritten_length:])
                 if self.states.source_finished:
                     self.clean()
