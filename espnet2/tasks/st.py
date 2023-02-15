@@ -16,6 +16,7 @@ from espnet2.asr.decoder.transformer_decoder import (
     LightweightConvolutionTransformerDecoder,
     TransformerDecoder,
     TransformerMDDecoder,
+    TransformerDecoderMCA
 )
 from espnet2.asr.encoder.abs_encoder import AbsEncoder
 from espnet2.asr.encoder.conformer_encoder import ConformerEncoder
@@ -132,6 +133,7 @@ decoder_choices = ClassChoices(
         lightweight_conv2d=LightweightConvolution2DTransformerDecoder,
         dynamic_conv=DynamicConvolutionTransformerDecoder,
         dynamic_conv2d=DynamicConvolution2DTransformerDecoder,
+        transformer_mca=TransformerDecoderMCA,
         rnn=RNNDecoder,
     ),
     type_check=AbsDecoder,

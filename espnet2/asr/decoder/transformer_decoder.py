@@ -4,6 +4,8 @@
 """Decoder definition."""
 from typing import Any, List, Sequence, Tuple
 
+import random
+
 import torch
 from typeguard import check_argument_types
 
@@ -776,3 +778,86 @@ class TransformerMDDecoder(BaseTransformerDecoder):
         # transpose state of [layer, batch] into [batch, layer]
         state_list = [[states[i][b] for i in range(n_layers)] for b in range(n_batch)]
         return logp, state_list
+
+class TransformerDecoderMCA(TransformerDecoder):
+
+    @staticmethod
+    def make_monotonic_mask(src_lens, tgt_lens):
+        bs = src_lens.shape[0]
+        src_len = src_lens.max().item()
+        tgt_len = tgt_lens.max().item()
+        enc_seq = torch.arange(0, src_len, dtype=src_lens.dtype, device=src_lens.device)
+        enc_seq = enc_seq.view((1, 1, -1)).expand(bs,tgt_len, src_len)
+
+        dec_seq = torch.arange(0, tgt_len, dtype=src_lens.dtype, device=src_lens.device)
+        dec_seq = dec_seq.view((1, -1, 1)).expand(bs,tgt_len, src_len)
+        scale = src_lens / tgt_lens 
+        dec_seq_scaled = (dec_seq + 1) * scale.view(-1, 1, 1)
+
+        tgt_lens = tgt_lens.view(-1, 1, 1)
+        mask = enc_seq.lt(dec_seq_scaled) * dec_seq.lt(tgt_lens)
+        return mask
+
+    def forward(
+        self,
+        hs_pad: torch.Tensor,
+        hlens: torch.Tensor,
+        ys_in_pad: torch.Tensor,
+        ys_in_lens: torch.Tensor,
+        return_hs: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward decoder.
+
+        Args:
+            hs_pad: encoded memory, float32  (batch, maxlen_in, feat)
+            hlens: (batch)
+            ys_in_pad:
+                input token ids, int64 (batch, maxlen_out)
+                if input_layer == "embed"
+                input tensor (batch, maxlen_out, #mels) in the other cases
+            ys_in_lens: (batch)
+        Returns:
+            (tuple): tuple containing:
+
+            x: decoded token score before softmax (batch, maxlen_out, token)
+                if use_output_layer is True,
+            olens: (batch, )
+        """
+        tgt = ys_in_pad
+        # tgt_mask: (B, 1, L)
+        tgt_mask = (~make_pad_mask(ys_in_lens)[:, None, :]).to(tgt.device)
+        # m: (1, L, L)
+        m = subsequent_mask(tgt_mask.size(-1), device=tgt_mask.device).unsqueeze(0)
+        # tgt_mask: (B, L, L)
+        tgt_mask = tgt_mask & m
+
+        memory = hs_pad
+        if self.training and random.random() < 0.5:
+            memory_mask = self.make_monotonic_mask(hlens, ys_in_lens)
+        else:
+            memory_mask = (~make_pad_mask(hlens, maxlen=memory.size(1)))[:, None, :].to(
+                memory.device
+            )
+        # Padding for Longformer
+        if memory_mask.shape[-1] != memory.shape[1]:
+            padlen = memory.shape[1] - memory_mask.shape[-1]
+            memory_mask = torch.nn.functional.pad(
+                memory_mask, (0, padlen), "constant", False
+            )
+
+        x = self.embed(tgt)
+        x, tgt_mask, memory, memory_mask = self.decoders(
+            x, tgt_mask, memory, memory_mask
+        )
+        if self.normalize_before:
+            x = self.after_norm(x)
+        if return_hs:
+            hs_asr = x
+        if self.output_layer is not None:
+            x = self.output_layer(x)
+
+        olens = tgt_mask.sum(1)
+
+        if return_hs:
+            return x, olens, hs_asr
+        return x, olens
