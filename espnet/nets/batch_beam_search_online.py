@@ -39,6 +39,7 @@ class BatchBeamSearchOnline(BatchBeamSearch):
         incremental_decode=False,
         incremental_strategy=None,
         ctc_wait=None,
+        length_penalty=None,
         recompute_decoder_states=False,
         **kwargs,
     ):
@@ -51,6 +52,7 @@ class BatchBeamSearchOnline(BatchBeamSearch):
         self.encoded_feat_length_limit = encoded_feat_length_limit
         self.decoder_text_length_limit = decoder_text_length_limit
         self.incremental_decode = incremental_decode
+        self.length_penalty = length_penalty
         
         self.hold_n = -1
         self.local_agreement = -1
@@ -292,7 +294,7 @@ class BatchBeamSearchOnline(BatchBeamSearch):
             return self.assemble_hyps(finished_hyps)
         elif len(finished_hyps) > 0:
             # Sort by length-normalized score
-            rets = sorted(finished_hyps, key=lambda x: x.score / x.length[0], reverse=True)
+            rets = sorted(finished_hyps, key=lambda x: self._norm_score(x.score, x.length[0]), reverse=True)
             best : BatchHypothesis = rets[0]
             # Always keep SOS token 
             stable_length = max(1, best.length[0] - 1)
@@ -314,6 +316,14 @@ class BatchBeamSearchOnline(BatchBeamSearch):
 
             return [self._select(best, 0),]
         return None
+
+    def _norm_score(self, score, l):
+        if self.length_penalty is not None:
+            return score + self.length_penalty * (l - 1)
+        elif l > 1:
+            return score / (l - 1)
+        else:
+            return score
 
     def _update_ctc_state(self, prev_hypo : BatchHypothesis, current_hypo : BatchHypothesis) -> BatchHypothesis:
         prev_hypo_len = prev_hypo.length[0]
@@ -352,7 +362,7 @@ class BatchBeamSearchOnline(BatchBeamSearch):
 
     def assemble_hyps(self, ended_hyps):
         """Assemble the hypotheses."""
-        nbest_hyps = sorted(ended_hyps, key=lambda x: x.score / len(x.yseq), reverse=True)
+        nbest_hyps = sorted(ended_hyps, key=lambda x: self._norm_score(x.score, len(x.yseq)), reverse=True)
         # check the number of hypotheses reaching to eos
         if len(nbest_hyps) == 0:
             logging.warning(
