@@ -1,6 +1,7 @@
 """Parallel beam search module for online simulation."""
 
 import logging
+import time
 from typing import Any  # noqa: H301
 from typing import Dict  # noqa: H301
 from typing import List  # noqa: H301
@@ -55,6 +56,8 @@ class BatchBeamSearchOnline(BatchBeamSearch):
         self.length_penalty = length_penalty
         
         self.hold_n = -1
+        self.wait_k = -1
+        self.wait_k_interval = -1
         self.local_agreement = -1
         self.ctc_wait = ctc_wait if ctc_wait else -1
         self.ctc_greedy_len = 0
@@ -64,6 +67,10 @@ class BatchBeamSearchOnline(BatchBeamSearch):
         if incremental_strategy:
             if incremental_strategy.startswith('hold-'):
                 self.hold_n = int(incremental_strategy[5:])
+            if incremental_strategy.startswith('wait-'):
+                waitk_args = incremental_strategy.split('-')[1:]
+                self.wait_k_interval = int(waitk_args[0])
+                self.wait_k = int(waitk_args[1])
             elif incremental_strategy.startswith('local-agreement-'):
                 self.local_agreement = int(incremental_strategy[16:])
             else:
@@ -213,6 +220,12 @@ class BatchBeamSearchOnline(BatchBeamSearch):
                 return False
         return True
 
+    def _contains_punct(self, token_id):
+        return any(
+            p in self.token_list[token_id] 
+            for p in list('.,?!():&')
+        )
+
     def process_one_block(self, h, is_final, maxlen, maxlenratio):
         """Recognize one block."""
         # extend states for ctc
@@ -230,10 +243,16 @@ class BatchBeamSearchOnline(BatchBeamSearch):
                 )
         
         if not is_final:
+            s = time.time()
             prev_hypo = copy.deepcopy(self.running_hyps)
+            logging.info(f'copy time: {time.time() - s}')
             
             if self.ctc_wait > -1:
                 maxlen = self.ctc_greedy_len - self.ctc_wait + 1
+            
+            if self.wait_k > -1:
+                logging.info(h.shape)
+                maxlen = h.shape[0] // self.wait_k_interval - self.wait_k
         
             if self.local_agreement > 0 and self.processed_block % self.local_agreement > 0:
                 return None
@@ -253,37 +272,44 @@ class BatchBeamSearchOnline(BatchBeamSearch):
                 best.yseq[:, best.length - 1] = self.eos
 
             n_batch = best.yseq.shape[0]
-            local_ended_hyps = set()
-            is_local_eos = best.yseq[torch.arange(n_batch), best.length - 1] == self.eos
+            finished = best.yseq[torch.arange(n_batch), best.length - 1] == self.eos
+
             for i in range(n_batch):
                 # Always remove beams with EOS 
-                if is_local_eos[i] or (
-                    not self.disable_repetition_detection
-                    and (
-                        (len(self.token_list[best.yseq[i, -1].item()].replace('▁', '')) > 0 and best.yseq[i, -1] in best.yseq[i, :-1])   # repetition
-                        or best.score[i] <= max_unreliable_score_score
-                    )
-                    # We allow repetitions if generated again with more context
-                    and not self.is_in_seen_unreliable_hypo(best.yseq[i]) 
-                    and not is_final
+
+                if (
+                        finished[i]
+                        or (best.finished[i] and not is_final) 
+                        or (
+                            not self.disable_repetition_detection
+                            and (
+                                (
+                                    len(self.token_list[best.yseq[i, -1].item()].replace('▁', '')) > 0 
+                                    and best.yseq[i, -1] in best.yseq[i, :-1]
+                                )   # repetition
+                                or best.score[i] <= max_unreliable_score_score
+                            )
+                            # We allow repetitions if generated again with more context
+                            and not self.is_in_seen_unreliable_hypo(best.yseq[i]) 
+                            and not is_final
+                        )
                 ):
                     hyp = self._batch_select(best, [i,])
-                    local_ended_hyps.add(i)
+                    finished[i] = True
                     finished_hyps.append(hyp)
                     max_unreliable_score_score = max(max_unreliable_score_score, hyp.score[0])
                     self.add_seen_unreliable_hypo(hyp.yseq[0])
 
             # remove finished/unreliable beams 
-            if len(local_ended_hyps) > 0:
-                beams_to_keep = set(range(n_batch)).difference(local_ended_hyps)
-                best = self._batch_select(best, list(beams_to_keep))
+            best = self._batch_select(best, torch.nonzero(finished == False).view(-1))
 
             if len(best) == 0:
                 logging.info("All beams finished.")
                 break
             else:
                 self.running_hyps = self.post_process(
-                    self.process_idx, maxlen, maxlenratio, best, self.ended_hyps
+                    #self.process_idx, maxlen, maxlenratio, best, self.ended_hyps
+                    self.process_idx, maxlen, maxlenratio, best, []
                 )
 
             # increment number
@@ -312,8 +338,15 @@ class BatchBeamSearchOnline(BatchBeamSearch):
             self.process_idx = stable_length - 1
             
             if not self.recompute_decoder_states:
+                s = time.time()
                 self.running_hyps = self._update_ctc_state(prev_hypo, best)
-
+                logging.info(f'update time {time.time() - s}')
+            assert self.running_hyps.yseq.shape[0] == 1
+            logging.info(
+                ''.join(
+                    [self.token_list[t.item()] for t in self.running_hyps.yseq[0]]
+                )
+            )
             return [self._select(best, 0),]
         return None
 

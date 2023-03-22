@@ -18,6 +18,7 @@ class Hypothesis(NamedTuple):
     scores: Dict[str, Union[float, torch.Tensor]] = dict()
     states: Dict[str, Any] = dict()
     hs: List[torch.Tensor] = []
+    finished: bool = False
 
     def asdict(self) -> dict:
         """Convert data to JSON-friendly dict."""
@@ -43,6 +44,7 @@ class BeamSearch(torch.nn.Module):
         pre_beam_ratio: float = 1.5,
         pre_beam_score_key: str = None,
         return_hs: bool = False,
+        ctc_finished_score: float = float('inf'),
     ):
         """Initialize beam search.
 
@@ -106,6 +108,7 @@ class BeamSearch(torch.nn.Module):
             and len(self.part_scorers) > 0
         )
         self.return_hs = return_hs
+        self.ctc_finished_score = ctc_finished_score
 
     def init_hyp(self, x: torch.Tensor) -> List[Hypothesis]:
         """Get an initial hypothesis data.
@@ -263,6 +266,29 @@ class BeamSearch(torch.nn.Module):
             new_scores[k] = self.append_token(prev_scores[k],  prev_scores[k][-1] + v[part_idx])
         return new_scores
 
+    def finished(
+        self,
+        next_part_scores: Dict[str, torch.Tensor],
+        part_idx: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Merge scores for new hypothesis.
+
+        Args:
+            next_part_scores (Dict[str, torch.Tensor]):
+                scores of partial tokens by `self.part_scorers`
+            part_idx (int): The new token id for `next_part_scores`
+
+        Returns:
+            Dict[str, torch.Tensor]: The new score dict.
+                Its keys are names of `self.full_scorers` and `self.part_scorers`.
+                Its values are scalar tensors by the scorers.
+
+        """
+        for k, v in next_part_scores.items():
+            if 'ctc' in k:
+                return (v[self.eos] - v[part_idx]).item() > self.ctc_finished_score
+        return False
+
     def merge_states(self, states: Any, part_states: Any, part_idx: int) -> Any:
         """Merge states for new hypothesis.
 
@@ -338,7 +364,8 @@ class BeamSearch(torch.nn.Module):
                             hyp.scores, scores, j, part_scores, part_j
                         ),
                         states=self.merge_states(states, part_states, part_j),
-                        hs=new_hs
+                        hs=new_hs,
+                        finished=self.finished(part_scores, part_j)
                     )
                 )
 

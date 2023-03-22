@@ -18,6 +18,7 @@ class BatchHypothesis(NamedTuple):
     scores: Dict[str, torch.Tensor] = dict()  # values: (batch,)
     states: Dict[str, Dict] = dict()
     hs: List[torch.Tensor] = []  # (batch, maxlen, adim)
+    finished: List[bool] = []  # (batch, maxlen, adim)
 
     def __len__(self) -> int:
         """Return a batch size."""
@@ -48,6 +49,7 @@ class BatchBeamSearch(BeamSearch):
             ) for k in self.scorers},
             states={k: [h.states[k] for h in hyps] for k in self.scorers},
             hs=hs,
+            finished=[h.finished for h in hyps],
         )
 
     def _batch_select(self, hyps: BatchHypothesis, ids: List[int]) -> BatchHypothesis:
@@ -66,6 +68,7 @@ class BatchBeamSearch(BeamSearch):
                 for k, v in hyps.states.items()
             },
             hs=hs,
+            finished=[hyps.finished[i] for i in ids],
         )
 
     def _batch_select_stable_prefix(self, best: BatchHypothesis, stable_len: int) -> BatchHypothesis:
@@ -89,6 +92,8 @@ class BatchBeamSearch(BeamSearch):
                 for k, v in best.states.items()
             },
             hs=hs,
+            finished=[False for i in [0,]],
+            #finished=[best.finished[i] for i in [0,]],
         )
 
     def _select(self, hyps: BatchHypothesis, i: int) -> Hypothesis:
@@ -100,6 +105,7 @@ class BatchBeamSearch(BeamSearch):
                 k: self.scorers[k].select_state(v, i) for k, v in hyps.states.items()
             },
             hs=hyps.hs[i] if self.return_hs else [],
+            finished=hyps.finished[i],
         )
 
     def unbatchfy(self, batch_hyps: BatchHypothesis) -> List[Hypothesis]:
@@ -114,6 +120,7 @@ class BatchBeamSearch(BeamSearch):
                     for k, v in self.scorers.items()
                 },
                 hs=batch_hyps.hs[i] if self.return_hs else [],
+                finished=batch_hyps.finished[i]
             )
             for i in range(len(batch_hyps.length))
         ]
@@ -342,6 +349,10 @@ class BatchBeamSearch(BeamSearch):
                         part_new_token_id,
                     ),
                     hs=new_hs,
+                    finished=self.finished(
+                        {k: v[part_prev_hyp_id] for k, v in part_scores.items()},
+                        part_new_token_id,
+                    )
                 )
             )
         return self.batchfy(best_hyps)

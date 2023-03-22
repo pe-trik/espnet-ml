@@ -75,7 +75,8 @@ class Speech2TextStreaming:
         incremental_decode: bool = False,
         incremental_strategy: str = None,
         ctc_wait: int = None,
-        length_penalty: float = None
+        length_penalty: float = None,
+        ctc_finished_score: float = float('inf'),
     ):
         assert check_argument_types()
 
@@ -163,6 +164,7 @@ class Speech2TextStreaming:
                 incremental_strategy=incremental_strategy,
                 ctc_wait=ctc_wait,
                 length_penalty=length_penalty,
+                ctc_finished_score=ctc_finished_score,
             )
 
             non_batch = [
