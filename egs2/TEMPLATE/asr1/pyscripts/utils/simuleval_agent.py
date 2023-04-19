@@ -11,8 +11,7 @@ from simuleval.agents.actions import ReadAction, WriteAction
 
 from espnet2.bin.st_inference import Speech2Text
 from espnet2.bin.st_inference_streaming import Speech2TextStreaming
-from espnet2.utils.types import str2bool, str2triple_str, str_or_none
-from typing import Any, List, Optional, Sequence, Tuple, Union
+from espnet2.utils.types import str2bool, str_or_none
 from espnet2.torch_utils.set_all_random_seed import set_all_random_seed
 import torch
 import logging
@@ -106,12 +105,15 @@ class DummyAgent(SpeechToTextAgent):
                 encoded_feat_length_limit=kwargs['encoded_feat_length_limit'],
                 incremental_decode=kwargs['incremental_decode'],
                 incremental_strategy=kwargs['incremental_strategy'],
+                length_penalty=kwargs['length_penalty'],
+                ctc_finished_score=kwargs['ctc_finished_score'],
             )
             self.speech2text = Speech2TextStreaming(**speech2text_kwargs)
         
         self.sim_chunk_length = kwargs['sim_chunk_length']
         self.backend = kwargs['backend']
         self.detokenizer = MosesDetokenizer(args.detokenizer) if args.detokenizer else None
+        self.chinese = args.sacrebleu_tokenizer == 'zh'
         self.clean()
 
     @staticmethod
@@ -369,6 +371,22 @@ class DummyAgent(SpeechToTextAgent):
             type=str,
             default=None,
         )
+        def none_or_float(arg):
+            if arg is None or arg.lower() == 'none':
+                return None
+            return float(arg)
+        group.add_argument(
+            "--length_penalty",
+            type=none_or_float,
+            default=None,
+            help='If None, uses length normalization.'
+        )
+        group.add_argument(
+            "--ctc_finished_score",
+            type=none_or_float,
+            default=float('inf'),
+            help='If None, uses length normalization.'
+        )
 
         return parser
 
@@ -400,13 +418,31 @@ class DummyAgent(SpeechToTextAgent):
                 if not self.states.source_finished:
                     prediction = results[0][2] if results else []
                     prediction = self.speech2text.converter.ids2tokens(prediction)
+                    while len(prediction) > 0:
+                        if self.chinese or prediction[-1].endswith('▁'):
+                            break
+                        prediction.pop()
                     prediction = self.speech2text.tokenizer.tokens2text(prediction).replace('&quot;', '"')
-                    prediction = self.detokenizer(prediction.split())
-                    prediction = ' '.join(prediction.split()[:-1])
+                    if '&' in prediction:
+                        prediction = prediction[:prediction.index('&')]
+                    if self.chinese:
+                        prediction = prediction.replace(',','，')
+                        prediction = prediction.replace('?','？')
                 else:
                     prediction = results[0][0].replace('&quot;', '"')
-                    prediction = self.detokenizer(prediction.split())
+                if len(prediction) > 0:
+                    p = []
+                    capitalize = True
+                    for c in prediction:
+                        if c == '.' or c == '!' or c =='?':
+                            capitalize = True
+                        if capitalize and c.lower() != c.upper():
+                            c = c.upper()
+                            capitalize = False
+                        p.append(c)
+                    prediction = ''.join(p)
                 logging.info(prediction)
+                logging.info('written: ' + "".join(self.states.target))
 
                 unwritten_length = len(prediction) - len("".join(self.states.target))
                 if unwritten_length == 0 and not self.states.source_finished:

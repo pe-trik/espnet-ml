@@ -8,6 +8,7 @@ from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
+from sentencepiece import SentencePieceProcessor
 from typeguard import check_argument_types, check_return_type
 
 from espnet2.asr.encoder.contextual_block_conformer_encoder import (  # noqa: H301
@@ -228,6 +229,8 @@ class Speech2TextStreaming:
         else:
             self.win_length = self.n_fft
 
+        self.sentence_piece = SentencePieceProcessor(model_file=st_train_args.bpemodel)
+
         self.reset()
 
     def reset(self):
@@ -235,6 +238,8 @@ class Speech2TextStreaming:
         self.encoder_states = None
         self.hier_encoder_states = None
         self.beam_search.reset()
+        self.enc_for_ctc_policy = None
+        self.consumed_speech = 0
 
     def apply_frontend(
         self, speech: torch.Tensor, prev_states=None, is_final: bool = False
@@ -366,6 +371,57 @@ class Speech2TextStreaming:
         if is_final:
             self.reset()
         return ret
+
+    @torch.no_grad()
+    def extend_for_ctc_policy(
+        self, speech: Union[torch.Tensor, np.ndarray], is_final: bool = True
+    ):
+        """Inference
+
+        Args:
+            data: Input speech data
+        Returns:
+            text, token, token_int, hyp
+
+        """
+        assert check_argument_types()
+
+        # Input as audio signal
+        if isinstance(speech, np.ndarray):
+            speech = torch.tensor(speech)
+        
+        speech = speech[self.consumed_speech:]
+        self.consumed_speech += speech.shape[0]
+        if speech.shape[0] == 0:
+            return
+
+        try:
+            feats, feats_lengths, self.frontend_states = self.apply_frontend(
+                speech, self.frontend_states, is_final=is_final
+            )
+        except:
+            return False
+        enc, enc_lengths, self.encoder_states = self.st_model.encoder(
+            feats,
+            feats_lengths,
+            self.encoder_states,
+            is_final=is_final,
+            infer_mode=True,
+        )
+
+        if hasattr(self.st_model, "hier_encoder") and self.st_model.hier_encoder is not None:
+            enc, enc_lengths, self.hier_encoder_states = self.st_model.hier_encoder(
+                enc,
+                enc_lengths,
+                self.hier_encoder_states,
+                is_final=is_final,
+                infer_mode=True,
+            )
+        if self.beam_search.enc_for_ctc_policy is None:
+            self.beam_search.enc_for_ctc_policy = enc[0]
+        else:
+            self.beam_search.enc_for_ctc_policy = torch.cat([self.beam_search.enc_for_ctc_policy, enc[0]], axis=0)
+        return enc[0].shape[0] > 0
 
     def assemble_hyps(self, hyps):
         nbest_hyps = hyps[: self.nbest]

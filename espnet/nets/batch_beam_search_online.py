@@ -90,6 +90,7 @@ class BatchBeamSearchOnline(BatchBeamSearch):
         self.process_idx = 0
         self.prev_output = None
         self.seen_unreliable_hyps = dict()
+        self.enc_for_ctc_policy = None
 
     def score_full(
         self, hyp: BatchHypothesis, x: torch.Tensor, pre_x: torch.Tensor = None
@@ -301,7 +302,7 @@ class BatchBeamSearchOnline(BatchBeamSearch):
                     self.add_seen_unreliable_hypo(hyp.yseq[0])
 
             # remove finished/unreliable beams 
-            best = self._batch_select(best, torch.nonzero(finished == False).view(-1))
+            best = self._batch_select(best, torch.nonzero(finished == False).view(-1).cpu())
 
             if len(best) == 0:
                 logging.info("All beams finished.")
@@ -381,6 +382,37 @@ class BatchBeamSearchOnline(BatchBeamSearch):
                     new_state = [new_state,]
                 current_hypo.states[scorer_name] = new_state
         return current_hypo
+    
+    def _ctc_force_decode_tokens(self, hypo : BatchHypothesis, tokens, start, end) -> BatchHypothesis:
+        if not isinstance(tokens, torch.LongTensor):
+            tokens = torch.LongTensor([[self.sos + 1] + tokens,]) - 1
+            tokens = torch.maximum(tokens, torch.tensor([0]))
+        finished = False
+
+        scorer_name = 'ctc'
+        new_state = hypo.states[scorer_name]
+        part_scorer = self.part_scorers[scorer_name]
+        total_score = 0
+        for token_idx in torch.arange(start + 1, end + 1):
+            curr_y = tokens[0,:token_idx].view((1,-1))
+            new_token = tokens[0,token_idx].view((1,1,-1))
+            score, new_state = part_scorer.batch_score_partial(
+                curr_y,
+                new_token,
+                new_state,
+                None, # x
+            )
+            eos_score = (score[0,self.eos] - score[0, tokens[0,token_idx]]).item()
+            #total_score += score[0, tokens[0,token_idx]]
+            finished |= eos_score > self.ctc_finished_score
+            new_state = part_scorer.select_state(
+                new_state,
+                0,
+                new_id=tokens[0,token_idx].item()
+            )
+            new_state = [new_state,]
+        hypo.states[scorer_name] = new_state
+        return hypo, finished, total_score
 
 
     def _compute_local_agreement(self, best: BatchHypothesis):

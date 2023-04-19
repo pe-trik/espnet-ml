@@ -81,7 +81,7 @@ class BatchBeamSearch(BeamSearch):
             hs = []
         score = best.score[:1] * 0
         for k, v in best.scores.items():
-            score += self.weights[k] * v[0,stable_len - 1]
+            score += self.weights[k] * v[0,stable_len - 1].to(score.device)
         return BatchHypothesis(
             yseq=best.yseq[:1, :stable_len],
             score=score,
@@ -418,5 +418,5 @@ class BatchBeamSearch(BeamSearch):
         for b in torch.nonzero(is_eos, as_tuple=False).view(-1):
             hyp = self._select(running_hyps, b)
             ended_hyps.append(hyp)
-        remained_ids = torch.nonzero(is_eos == 0, as_tuple=False).view(-1)
+        remained_ids = torch.nonzero(is_eos == 0, as_tuple=False).view(-1).cpu()
         return self._batch_select(running_hyps, remained_ids)
